@@ -214,7 +214,7 @@ def get_sprint_summary(conn, bid, sprintname, team, max_jira_results):
             + ' and status = "DONE"',
             0,
             max_jira_results,
-        ).iterable
+        )
         print("%s completed %d cards" % (member["name"], len(completed_cards)))
 
 

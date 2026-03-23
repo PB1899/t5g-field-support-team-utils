@@ -115,7 +115,7 @@ def get_escalations(cfg, cases):
     # Custom field: SFDC Case Links in escalations proj.
     escalated_cards = jira_conn.search_issues(
         jira_query, 0, max_cards, fields=["customfield_10979"], expand="renderedFields"
-    ).iterable
+    )
     escalations = []
     for card in escalated_cards:
         # Custom field: SFDC Case Links in escalations proj.
@@ -222,14 +222,14 @@ def _execute_jira_query_with_retry(jira_conn, jira_query, cfg, max_results):
         max_results: Maximum number of results to return
 
     Returns:
-        iterable: Iterator of JIRA issue objects matching the query
+        list: list of JIRA issue objects matching the query
     """
     try:
-        return jira_conn.search_issues(jira_query, 0, max_results).iterable
+        return jira_conn.search_issues(jira_query, 0, max_results)
     except JIRAError:
         logging.warning("JIRA Exception. Possible 401. Reconnecting.....")
         jira_conn = libtelco5g.jira_connection(cfg)
-        return jira_conn.search_issues(jira_query, 0, max_results).iterable
+        return jira_conn.search_issues(jira_query, 0, max_results)
 
 
 def _get_jira_issue_with_retry(jira_conn, issue_key, cfg):
@@ -268,7 +268,7 @@ def _get_jira_cards_list(cfg, jira_conn):
         jira_conn: Active JIRA connection object
 
     Returns:
-        iterable: Iterator of JIRA card objects matching the query
+        card_list: list of JIRA card objects matching the query
     """
     max_cards = cfg["max_jira_results"]
     project = libtelco5g.get_project_id(jira_conn, cfg["project"])
