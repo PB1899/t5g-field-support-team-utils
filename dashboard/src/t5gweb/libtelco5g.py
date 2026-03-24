@@ -5,14 +5,20 @@ from __future__ import print_function
 import datetime
 import json
 import logging
+import os
 import re
 import statistics
 import time
+import xmlrpc
 from urllib.parse import urlparse
 
+import bugzilla
 import redis
 import requests
 from jira import JIRA
+from jira.exceptions import JIRAError
+from slack_sdk import WebClient
+
 from t5gweb.utils import (
     email_notify,
     exists_or_zero,
@@ -62,7 +68,7 @@ def jira_connection(cfg):
     """
 
     logging.warning("attempting to connect to jira...")
-    jira = JIRA(server=cfg["server"], token_auth=cfg["password"])
+    jira = JIRA(server=cfg["server"], basic_auth=(cfg["username"], cfg["password"]))
 
     return jira
 
@@ -126,7 +132,9 @@ def get_previous_card(conn, cfg, case):
         Issue: First matching JIRA issue object, or None if no match found
     """
     previous_issues_query = f"project = {cfg['project']} AND summary ~ '{case}'"
-    previous_issues = conn.search_issues(previous_issues_query)
+    previous_issues = conn.search_issues(
+        previous_issues_query, 0, cfg["max_jira_results"]
+    )
     if len(previous_issues) > 0:
         return previous_issues[0]
     return None
@@ -177,7 +185,7 @@ def get_last_sprint(conn, bid, sprintname):
             return b
 
 
-def get_sprint_summary(conn, bid, sprintname, team):
+def get_sprint_summary(conn, bid, sprintname, team, max_jira_results):
     """Print summary of completed cards per team member for the last sprint
 
     Queries JIRA for completed cards in the previous sprint and prints the
@@ -188,7 +196,7 @@ def get_sprint_summary(conn, bid, sprintname, team):
         bid: Board ID to query
         sprintname: Sprint name pattern
         team: List of team member dictionaries containing 'jira_user' and 'name'
-
+        max_jira_results: Maximum number of results to return from JIRA
     Returns:
         None. Prints completion statistics to stdout.
     """
@@ -205,8 +213,8 @@ def get_sprint_summary(conn, bid, sprintname, team):
             + str(user)
             + ' and status = "DONE"',
             0,
-            1000,
-        ).iterable
+            max_jira_results,
+        )
         print("%s completed %d cards" % (member["name"], len(completed_cards)))
 
 
@@ -385,7 +393,9 @@ def _setup_card_creation_context(cfg):
         raise ValueError("No sprintname is defined.")
 
     sprint = get_latest_sprint(jira_conn, board.id, cfg["sprintname"])
-    created_cards = get_issues_in_sprint(cfg, sprint, jira_conn)
+    created_cards = get_issues_in_sprint(
+        cfg, sprint, jira_conn, cfg["max_jira_results"]
+    )
     created_cases = [card["fields"]["summary"].split(":")[0] for card in created_cards]
 
     return {
@@ -419,6 +429,35 @@ def _filter_novel_cases(new_cases, created_cases):
     return novel_cases
 
 
+def _notify_slack_error(cfg, case, error_msg):
+    """Send a Slack notification when JIRA card creation fails.
+
+    Posts an error message to the low severity Slack channel to alert the team
+    that a card could not be created for a case.
+
+    Args:
+        cfg: Configuration dictionary containing slack_token and channel settings
+        case: Case number that failed
+        error_msg: Error message describing the failure
+    """
+    if not cfg.get("slack_token") or not cfg.get("low_severity_slack_channel"):
+        logging.warning("Cannot notify Slack: missing token or channel config")
+        return
+
+    try:
+        client = WebClient(token=cfg["slack_token"])
+        message = (
+            f":warning: Failed to create JIRA card for case {case}\n"
+            f"Error: {error_msg[:200]}"  # Truncate long error messages
+        )
+        client.chat_postMessage(
+            channel=cfg["low_severity_slack_channel"],
+            text=message,
+        )
+    except Exception as slack_err:
+        logging.error(f"Failed to send Slack error notification: {slack_err}")
+
+
 def _process_single_case(case, cases, context, cfg):
     """Process a single case and create its JIRA card
 
@@ -450,7 +489,12 @@ def _process_single_case(case, cases, context, cfg):
 
     # Create the card
     card_info = _build_card_info(case, cases, cfg, assignee)
-    new_card = _create_jira_card(card_info, context["jira_conn"])
+    try:
+        new_card = _create_jira_card(card_info, context["jira_conn"])
+    except JIRAError as e:
+        logging.error(f"Failed to create JIRA card for case {case}: {e}")
+        _notify_slack_error(cfg, case, str(e))
+        return None
 
     # Post-process the card
     _post_process_card(new_card, case, cases, context, cfg)
@@ -538,7 +582,12 @@ def _determine_assignee(case, cases, cfg):
         return None
 
     # Try to match by account
-    for member in cfg["team"]:
+    team = [
+        member
+        for member in cfg["team"]
+        if member.get("active", "true").lower() == "true"
+    ]
+    for member in team:
         for account in member["accounts"]:
             if account.lower() in cases[case]["account"].lower():
                 member["displayName"] = member["name"]
@@ -546,7 +595,7 @@ def _determine_assignee(case, cases, cfg):
 
     # No match found, assign randomly
     last_choice = redis_get("last_choice")
-    assignee = get_random_member(cfg["team"], last_choice)
+    assignee = get_random_member(team, last_choice)
     redis_set("last_choice", json.dumps(assignee))
     assignee["displayName"] = assignee["name"]
     return assignee
@@ -602,7 +651,7 @@ def _build_card_info(case, cases, cfg, assignee):
     }
 
     if assignee:
-        card_info["assignee"] = {"name": assignee["jira_user"]}
+        card_info["assignee"] = {"accountId": assignee["jira_account_id"]}
 
     return card_info
 
@@ -622,7 +671,7 @@ def _create_jira_card(card_info, jira_conn):
     """
     logging.warning(f"Creating card for case {card_info['summary'].split(':')[0]}")
     new_card = jira_conn.create_issue(fields=card_info)
-    new_card.update(fields={"customfield_12317313": "TRACK"})
+    new_card.update(fields={"customfield_10783": "TRACK"})  # Release Note Text
     logging.warning(f"Created {new_card.key}")
     return new_card
 
@@ -1176,6 +1225,8 @@ def sync_priority(cfg):
             card key
     """
     cards = redis_get("cards")
+    jira_conn = jira_connection(cfg)
+
     sev_map = {
         re.search(r"[a-zA-Z]+", k).group(): v for k, v in portal2jira_sevs.items()
     }
@@ -1193,13 +1244,36 @@ def sync_priority(cfg):
             )
         )
         logging.warning("updating {} to a priority of {}".format(card, new_priority))
-        jira_conn = jira_connection(cfg)
-        oos_issue = jira_conn.issue(card)
+        oos_issue = _get_jira_issue_with_retry(jira_conn, card, cfg)
         oos_issue.update(fields={"priority": {"name": new_priority}})
     return out_of_sync
 
 
-def get_issues_in_sprint(cfg, sprint, jira_conn, max_results=1000):
+def _get_jira_issue_with_retry(jira_conn, issue_key, cfg, expand=None):
+    # Generated by: Cursor
+    """Get JIRA issue with automatic retry on authentication errors
+
+    Attempts to retrieve a JIRA issue and automatically reconnects if a
+    JIRAError occurs (typically 401 authentication errors).
+
+    Args:
+        jira_conn: Active JIRA connection object
+        issue_key: JIRA issue key (e.g., 'PROJECT-123')
+        cfg: Configuration dictionary for reconnection if needed
+        expand: string of expansion fields (ex: renderedFields)
+
+    Returns:
+        Issue: JIRA issue object
+    """
+    try:
+        return jira_conn.issue(issue_key, expand=expand)
+    except JIRAError:
+        logging.warning("JIRA Exception. Possible 401. Reconnecting.....")
+        jira_conn = jira_connection(cfg)
+        return jira_conn.issue(issue_key, expand=expand)
+
+
+def get_issues_in_sprint(cfg, sprint, jira_conn, max_results=False):
     """Get all issues in a specified sprint with specified labels
 
     Args:
@@ -1216,7 +1290,7 @@ def get_issues_in_sprint(cfg, sprint, jira_conn, max_results=1000):
         "sprint=" + str(sprint.id) + ' AND labels = "' + cfg["jira_query"] + '"'
     )
     cards = jira_conn.search_issues(
-        jql_str=jira_query, json_result=True, maxResults=max_results
+        jql_str=jira_query, json_result=True, maxResults=cfg["max_jira_results"]
     )
     return cards["issues"]
 
@@ -1285,6 +1359,184 @@ def sync_portal_to_jira():
     end = time.time()
     logging.warning("synced to jira in {} seconds".format(end - start))
     return response
+
+
+def tag_bz():
+    """Function to tag Bugzilla and JIRA bugs with Telco keywords
+
+    Telco5g-specific task that tags bugs and JIRA issues with 'Telco' and
+    'Telco:Case' keywords in the internal whiteboard or private keywords
+    fields. Only runs if jira_query is 'field'. Sends email summary of
+    tagging actions.
+
+    For Bugzilla bugs, updates the internal_whiteboard field.
+    For JIRA bugs, updates the Private Keywords (customfield_10999) field
+    or falls back to Internal Whiteboard (customfield_11004) if Private
+    Keywords is not available.
+
+    Returns:
+        num_tagged: number of bugs or issues tagged
+    """
+
+    cfg = set_cfg()
+    if cfg["jira_query"] != "field":
+        logging.warning("bz tagging not enabled for {}".format(cfg["jira_query"]))
+        return
+
+    logging.warning("getting bugzillas")
+    bz_url = "bugzilla.redhat.com"
+    bz_api = bugzilla.Bugzilla(bz_url, api_key=cfg["bz_key"])
+    cases = redis_get("cases")
+    bugs = redis_get("bugs")
+    issues = redis_get("issues")
+    jira_conn = jira_connection(cfg)
+    email_body = {
+        "Cards with No Private Keywords Field": {"cards": []},
+        "Script Tagged Private Keywords": {"cards": []},
+        "Cards with No Internal Whiteboard Field": {"cards": []},
+        "Script Tagged Internal Whiteboard": {"cards": []},
+        "Non-Bug Cards Linked to Cases, Not Tagged": {"cards": []},
+    }
+
+    num_tagged = 0
+
+    logging.warning("tagging bugzillas")
+    for case in bugs:
+        if case in cases:
+            for bug in bugs[case]:
+                try:
+                    bz = bz_api.getbug(bug["bugzillaNumber"])
+                except xmlrpc.client.Fault:
+                    logging.warning(
+                        "error: {} is restricted".format(bug["bugzillaNumber"])
+                    )
+                    bz = None
+                if bz:
+                    update = None
+                    if "telco" not in bz.internal_whiteboard.lower():
+                        update = bz_api.build_update(
+                            internal_whiteboard="Telco Telco:Case "
+                            + bz.internal_whiteboard,
+                            minor_update=True,
+                        )
+                    elif "telco:case" not in bz.internal_whiteboard.lower():
+                        update = bz_api.build_update(
+                            internal_whiteboard=bz.internal_whiteboard + " Telco:Case",
+                            minor_update=True,
+                        )
+                    if update:
+                        logging.warning("tagging BZ:" + str(bz.id))
+                        try:
+                            bz_api.update_bugs([bz.id], update)
+                            num_tagged += 1
+                        except xmlrpc.client.Fault:
+                            logging.warning("Tried and failed to tag " + str(bz.id))
+                            continue
+    logging.warning("tagging Jira Bugs")
+    for case in issues:
+        if case in cases:
+            for issue in issues[case]:
+                if issue["jira_type"] == "Bug":
+                    attribute_error = False
+                    tagged = False
+                    card = _get_jira_issue_with_retry(
+                        jira_conn, issue["id"], cfg, expand="renderedFields"
+                    )
+                    try:
+                        # RH Private Keywords custom field
+                        private_keywords = card.renderedFields.customfield_10999
+                    except AttributeError:
+                        logging.warning(
+                            "No Private Keywords field for {}, skipping".format(
+                                str(card)
+                            )
+                        )
+                        attribute_error = True
+                        email_body["Cards with No Private Keywords Field"][
+                            "cards"
+                        ].append(str(card))
+
+                    # Skip if Private Keywords are not enabled.
+                    if not attribute_error:
+                        if private_keywords is None:
+                            private_keywords = ""
+                        new_keywords = private_keywords
+                        if "Telco" not in new_keywords:
+                            new_keywords += ",Telco,Telco:Case"
+                            logging.warning("tagging Jira Bug:" + str(card))
+                            card.update(fields={"customfield_10999": new_keywords})
+                            num_tagged += 1
+                            email_body["Script Tagged Private Keywords"][
+                                "cards"
+                            ].append(str(card))
+                        elif "Telco:Case" not in new_keywords:
+                            new_keywords += ",Telco:Case"
+                            logging.warning("tagging Jira Bug:" + str(card))
+                            card.update(fields={"customfield_10999": new_keywords})
+                            num_tagged += 1
+                            email_body["Script Tagged Private Keywords"][
+                                "cards"
+                            ].append(str(card))
+                        tagged = True
+
+                    if tagged is False:
+                        try:
+                            # Internal Whiteboard custom field
+                            internal_whiteboard = card.renderedFields.customfield_11004
+                        except AttributeError:
+                            logging.warning(
+                                "No Internal Whiteboard field for {}, skipping".format(
+                                    str(card)
+                                )
+                            )
+                            email_body["Cards with No Internal Whiteboard Field"][
+                                "cards"
+                            ].append(str(card))
+                            continue
+                        if internal_whiteboard is None:
+                            internal_whiteboard = ""
+                        if "telco" not in internal_whiteboard.lower():
+                            logging.warning("tagging Jira Bug:" + str(card))
+                            internal_whiteboard = (
+                                "Telco Telco:Case " + internal_whiteboard
+                            )
+                            update = card.update(
+                                # Internal Whiteboard custom field
+                                customfield_11004=internal_whiteboard
+                            )
+                            num_tagged += 1
+                            email_body["Script Tagged Internal Whiteboard"][
+                                "cards"
+                            ].append(str(card))
+                        elif "telco:case" not in internal_whiteboard.lower():
+                            logging.warning("tagging Jira Bug:" + str(card))
+                            internal_whiteboard = internal_whiteboard + " Telco:Case"
+                            update = card.update(
+                                # Internal Whiteboard custom field
+                                customfield_11004=internal_whiteboard
+                            )
+                            num_tagged += 1
+                            email_body["Script Tagged Internal Whiteboard"][
+                                "cards"
+                            ].append(str(card))
+                else:
+                    email_body["Non-Bug Cards Linked to Cases, Not Tagged"][
+                        "cards"
+                    ].append(issue["id"])
+
+    for category in email_body:
+        message = f"{category}:\n"
+        if email_body[category]["cards"]:
+            for card in email_body[category]["cards"]:
+                message += f"   - {card}\n"
+        else:
+            message += "   - No cards in this category\n"
+        email_body[category]["full_message"] = message
+    cfg["to"] = os.environ.get("bug_email")
+    cfg["subject"] = "Summary: Jira Bug Tagging"
+    email_notify(cfg, email_body)
+
+    return num_tagged
 
 
 def main():
