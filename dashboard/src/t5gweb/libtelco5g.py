@@ -546,7 +546,10 @@ def _handle_old_case(case, context, cfg):
         bool: True if previous card was found and reopened, False otherwise
     """
     previous_issue = get_previous_card(context["jira_conn"], cfg, case)
-    if previous_issue:
+
+    read_only = os.getenv("READ_ONLY", "false") == "true"
+
+    if previous_issue and not read_only:
         logging.warning(
             f"Updating: {previous_issue.key} rather than creating new card."
         )
