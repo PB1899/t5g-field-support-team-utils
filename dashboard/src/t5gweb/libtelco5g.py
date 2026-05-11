@@ -614,9 +614,9 @@ def _assign_cases_batch(novel_cases, cases, cfg):
     if not unmatched:
         return assignments
 
-    if len(novel_cases) <= len(team):
-        # Enough engineers to give everyone at most one case — exclude those
-        # already assigned via account matching
+    if len(unmatched) <= len(team):
+        # Fewer unmatched cases than engineers — exclude account-assigned ones
+        # so no engineer gets more than one case in this batch
         available = [
             m for m in team if m["jira_account_id"] not in account_assigned_ids
         ]

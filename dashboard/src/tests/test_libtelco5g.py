@@ -147,18 +147,16 @@ def test_account_assigned_engineers_excluded_when_cases_lte_team(team, cases):
 
 
 def test_multiple_account_cases_still_exclude_their_engineers(team, cases):
-    # 4 cases, 3 engineers: 001+002->Alice, 003->Bob, 004 must go to Carol
-    # Even though Alice got 2 cases via account, she is still excluded from round-robin
-    # because total cases (4) > team size (3), BUT account-matched engineers
-    # are only excluded when cases <= team — here 4 > 3 so all engineers are eligible
+    # 4 cases, 3 engineers: 001+002->Alice, 003->Bob, 1 unmatched case (004)
+    # 1 unmatched <= 3 team size, so account-assigned engineers are excluded —
+    # 004 must go to Carol (the only non-account-assigned engineer)
     cfg = {"team": team}
-    all_ids = {"a1", "b1", "c1"}
     result = _assign_cases_batch(["001", "002", "003", "004"], cases, cfg)
 
     assert result["001"]["jira_account_id"] == "a1"
     assert result["002"]["jira_account_id"] == "a1"
     assert result["003"]["jira_account_id"] == "b1"
-    assert result["004"]["jira_account_id"] in all_ids
+    assert result["004"]["jira_account_id"] == "c1"
 
 
 def test_account_assigned_engineers_excluded_even_with_multiple_account_cases(
