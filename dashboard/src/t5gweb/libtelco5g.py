@@ -594,8 +594,12 @@ def _assign_cases_batch(novel_cases, cases, cfg):
     for case in novel_cases:
         matched = next(
             (
-                m for m in team
-                if any(acct.lower() in cases[case]["account"].lower() for acct in m["accounts"])
+                m
+                for m in team
+                if any(
+                    acct.lower() in cases[case]["account"].lower()
+                    for acct in m["accounts"]
+                )
             ),
             None,
         )
@@ -613,7 +617,9 @@ def _assign_cases_batch(novel_cases, cases, cfg):
     if len(novel_cases) <= len(team):
         # Enough engineers to give everyone at most one case — exclude those
         # already assigned via account matching
-        available = [m for m in team if m["jira_account_id"] not in account_assigned_ids]
+        available = [
+            m for m in team if m["jira_account_id"] not in account_assigned_ids
+        ]
     else:
         available = team
 

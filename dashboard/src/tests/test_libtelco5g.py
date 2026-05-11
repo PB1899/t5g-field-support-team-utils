@@ -1,4 +1,5 @@
 import pytest
+
 from t5gweb.libtelco5g import (
     _assign_cases_batch,
     get_case_number,
@@ -86,12 +87,31 @@ def test_is_bug_missing_target(item, expected_result):
 
 # --- _assign_cases_batch tests ---
 
+
 @pytest.fixture
 def team():
     return [
-        {"name": "Alice", "jira_account_id": "a1", "jira_user": "alice", "accounts": ["Acme"], "active": "true"},
-        {"name": "Bob",   "jira_account_id": "b1", "jira_user": "bob",   "accounts": ["Globex"], "active": "true"},
-        {"name": "Carol", "jira_account_id": "c1", "jira_user": "carol", "accounts": [], "active": "true"},
+        {
+            "name": "Alice",
+            "jira_account_id": "a1",
+            "jira_user": "alice",
+            "accounts": ["Acme"],
+            "active": "true",
+        },
+        {
+            "name": "Bob",
+            "jira_account_id": "b1",
+            "jira_user": "bob",
+            "accounts": ["Globex"],
+            "active": "true",
+        },
+        {
+            "name": "Carol",
+            "jira_account_id": "c1",
+            "jira_user": "carol",
+            "accounts": [],
+            "active": "true",
+        },
     ]
 
 
@@ -141,7 +161,9 @@ def test_multiple_account_cases_still_exclude_their_engineers(team, cases):
     assert result["004"]["jira_account_id"] in all_ids
 
 
-def test_account_assigned_engineers_excluded_even_with_multiple_account_cases(team, cases):
+def test_account_assigned_engineers_excluded_even_with_multiple_account_cases(
+    team, cases
+):
     # 3 cases <= 3 engineers: 001+002 both go to Alice via account,
     # 004 is unmatched — pool must exclude Alice, so Carol gets it
     cfg = {"team": team}
